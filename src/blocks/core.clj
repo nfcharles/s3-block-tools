@@ -1,7 +1,9 @@
 (ns blocks.core
   (:require [clojure.core.async :as async]
             [clojure.data.json :as json]
-            [clojure.pprint :as pprint])
+            [clojure.pprint :as pprint]
+            [blocks.macro :refer :all]
+            [taoensso.timbre :as timbre :refer [log debug info warn error fatal debugf infof warnf]])
   (import [org.apache.hadoop.fs.s3 Jets3tFileSystemStore INode]
 	  [org.apache.hadoop.fs Path]	  
 	  [org.jets3t.service S3Service]
@@ -14,25 +16,6 @@
   (:gen-class))
 
 
-;;;; ===== MACROS =====
-
-(defmacro with-pool [bindings & body]
-  "(with-pool [pool (...)]
-      (let [completion-service (... pool)]
-        ))"
-  (assert (vector? bindings) "vector required for bindings")
-  (assert (== (count bindings) 2) "one binding pair expected")
-  (assert (symbol? (bindings 0)) "only symbol allowed in binding")
-  `(let ~(subvec bindings 0 2)
-     (try
-       ~@body
-       (finally
-         (.shutdown ~(bindings 0))))))
-
-;;;; ===== END MACROS =====
-
-
-
 (defn credentials []
   (let [creds (.getCredentials (DefaultAWSCredentialsProviderChain.))]
     (hash-map
@@ -41,7 +24,6 @@
 
 (defn service [access-key secret-key]
   (let [aws-creds (AWSCredentials. access-key secret-key)]
-    (println aws-creds)
     (RestS3Service. aws-creds)))
 
 (defn rest-client []
@@ -89,37 +71,32 @@
   (INode/deserialize (-get svc bkt path false)))
 
 (defn gen-filter [expr]
-  (println expr)
   (fn [key]
     (let [res (re-matches (re-pattern expr) key)]
       res)))
 
-;;; ----- LIST FUNCTIONS -----
-
-(defn list-blocks [svc bkt path]
-  (doseq [blk (.getBlocks (inode svc bkt path))]
-    (println (.getId blk))))
-
 (defn block-name [id]
   (str "block_" id))
 
-(defn record [blk]
+(defn record [bkt blk]
   (hash-map
+    :bkt bkt
     :id  (block-name (.getId blk))
     :len (.getLength blk)))
 
 (defn get-blocks [svc bkt path]
-  (loop [blks (.getBlocks (inode svc bkt path))
-         acc []]
-    (if-let [blk (first blks)]
-      (recur (rest blks) (conj acc (record blk)))
-      acc)))
+  (let [bkt-name (.getName bkt)]
+    (loop [blks (.getBlocks (inode svc bkt path))
+           acc []]
+      (if-let [blk (first blks)]
+        (recur (rest blks) (conj acc (record bkt-name blk)))
+        acc))))
 
 (defn list-objects [svc bkt-name pfx & {:keys [delim filter]
                                          :or {delim nil
 					      filter (fn [x] true)}}]
   (let [ret (.listObjects svc bkt-name pfx delim)]
-    (println (format "count.keys.unfiltered %d" (count ret)))
+    (infof "count.keys.unfiltered %d" (count ret))
     (loop [objs ret
            acc []]
       (if-let [o (first objs)]
@@ -133,81 +110,55 @@
   (try
     (.get (.take csvc))
     (catch java.lang.Exception e
-      (println e))))
+      (error e))))
 
-(defn assemble-blocks [csvc n]
+(defn assemble-blocks [csvc n & {:keys [progress-interval]
+                                 :or {progress-interval 50}}]
   (loop [i n
          acc []]
     (if (> i 0)
       (if-let [res (-get-from-svc csvc)]
-        (recur (dec i) (conj acc res)))
-      (let [blocks (flatten acc)]
-        (sort-by #(:len %) < blocks)))))
+        (let [remain (dec i)]
+          (if (= 0 (mod remain progress-interval))
+	    (infof "%d blocks remaining" remain))
+          (recur remain (conj acc res))))
+      (do
+        (infof "Retrieved %d blocks" n)
+        (flatten acc)))))
+
+;; (sort-by #(:len %) < blocks)
 
 ;;; ----- DRIVERS -----
-
-(comment ; deprecated
-(defn start-block-reader [threads svc bkt in-ch]
-  (let [out-ch (async/chan 1)]
-    (async/thread
-      (println "Starting block reader...")
-      (with-pool [pool (Executors/newFixedThreadPool threads)]
-        (time
-          (let [csvc (ExecutorCompletionService. pool)]
-            (loop [n 0]
-	      (if-let [path (async/<!! in-ch)]
-	        (do
-                  (.submit csvc #(get-blocks svc bkt path))
-		  (recur (inc n)))
-	        (async/>!! out-ch (assemble-blocks csvc n))))
-            (async/close! out-ch)))))
-    out-ch))
-
-(defn start-key-reader [svc bkt pfx expr]
-  (let [out-ch (async/chan 1000)]
-    (async/thread
-      (println "Starting key reader...")
-      (let [keys (list-objects svc bkt pfx :filter (gen-filter expr))]
-        (println (format "count.keys.filtered %d" (count keys)))      
-        (doseq [key keys]
-	  (async/>!! out-ch key))
-	(async/close! out-ch)))
-    out-ch))
-)
-
-;;
-;; ----- multi mode -----
-;;
 
 (defn start-block-reader [threads svc bkt in-ch]
   (let [out-ch (async/chan 10)]
     (async/thread
-      (println "Starting block reader...")
+      (infof "Starting block reader...")
       (with-pool [pool (Executors/newFixedThreadPool threads)]
         (time
           (let [csvc (ExecutorCompletionService. pool)]
             (loop []	  
               (if-let [payload (async/<!! in-ch)]
                 (let [keys (:keys payload)]
-                  (println (format "Getting blocks for prefix=%s..." (:pfx payload)))
+                  (infof "Getting blocks for prefix=%s..." (:pfx payload))
                   (doseq [key keys]
                     (.submit csvc #(get-blocks svc bkt key)))
                   (async/>!! out-ch (assemble-blocks csvc (count keys)))
 		  (recur))
                 (async/close! out-ch))))))
-      (println "Block Reader done."))
+      (info "Block Reader done."))
   out-ch))
     
 (defn start-prefix-reader [svc bkt expr pfxs]
   (let [out-ch (async/chan 10)]
     (async/thread
-      (println "Starting key reader...")
+      (info "Starting key reader...")
       (doseq [pfx pfxs]
         (let [keys (list-objects svc bkt pfx :filter (gen-filter expr))]
-          (println (format "count.keys.filtered %d" (count keys)))
+          (infof "count.keys.filtered %d" (count keys))
 	  (async/>!! out-ch {:pfx pfx :keys keys})))
       (async/close! out-ch)
-      (println "Key Reader done."))
+      (info "Key Reader done."))
     out-ch))
 
 
@@ -215,9 +166,9 @@
 
 (defn write-blocks [name blks]
   (let [f (format "%s.json" name)]
-    (println (format "Writing blocks file \"%s\"" f))
+    (infof "Writing blocks file \"%s\"" f)
     (spit f (json/write-str blks))
-    (println "done")))
+    (info "done")))
 
 (defn write [names in-ch]
   (loop [pfxs names]
@@ -235,11 +186,11 @@
 	expr  (nth args 4)
 	svc   (rest-client)
 	bkt   (bucket src)]
-    (println (format "THREADS=%d" thrd))
-    (println (format "BUCKET=%s" src))
-    (println (format "PREFIX=%s" pfxs))
-    (println (format "NAMES=%s" names))
-    (println (format "EXPR=%s" expr))
+    (infof "THREADS=%d" thrd)
+    (infof "BUCKET=%s" src)
+    (infof "PREFIX=%s" pfxs)
+    (infof "NAMES=%s" names)
+    (infof "EXPR=%s" expr)
 
     (let [out (->> (start-prefix-reader svc bkt expr pfxs)
                    (start-block-reader thrd svc bkt))]

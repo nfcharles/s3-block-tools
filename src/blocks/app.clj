@@ -2,7 +2,8 @@
   (:require [clojure.core.async :as async]
             [clojure.data.json :as json]
             [clojure.pprint :as pprint]
-	    [blocks.core :as blocks-core])
+	    [blocks.macro :refer :all]
+	    [taoensso.timbre :as timbre :refer [log debug info warn error fatal debugf infof warnf]])
   (import [com.amazonaws.services.lambda AWSLambdaAsyncClientBuilder AWSLambdaAsync]
           [com.amazonaws.services.lambda.model InvokeRequest InvokeResult]
 	  [java.nio ByteBuffer]
@@ -10,7 +11,7 @@
   (:gen-class))
 
 
-(defn ^AWSLambdaAsync client []
+(defn ^AWSLambdaAsync lambda-client []
   (AWSLambdaAsyncClientBuilder/defaultClient))
 
 (defn ^InvokeRequest invoke-request [func-name payload]
@@ -25,14 +26,14 @@
           status-code (.getStatusCode res)]
       (if (= status-code 200)
         (let [payload (.getPayload res)]
-          (println "Lambda function returned:")
-          (println (String. (.array payload))))
-        (println (format "Received a non-OK response from AWS: %d" status-code))))
+          (info "Lambda function returned:")
+          (info (String. (.array payload))))
+        (infof "Received a non-OK response from AWS: %d" status-code)))
     (catch InterruptedException e
-      (println (.getMessage e))
+      (error e)
       (System/exit 1))
     (catch ExecutionException e
-      (println (.getMessage e))
+      (error e)
       (System/exit 1))))
 
 (defn split-queue [status queue]
@@ -48,7 +49,6 @@
 
 (defn check-queue [queue & {:keys [timeout]
                             :or {timeout 1000}}]  ;; TODO: make timeout default to 1000 ms
-  (println "Checking queue...")
   (let [n (count queue)]
     (if (= n 0)
       [[] []]
@@ -61,17 +61,19 @@
           (if at-least-one
             (split-queue status queue)
             (do
-              (println ".")
+              (info ".")
               (try
                 (Thread/sleep timeout)
                 (catch InterruptedException e
-                  (println "Thread/sleep was interrupted!")
+                  (error "Thread/sleep was interrupted!")
+                  (error e)
                   (System/exit 1)))
               (recur 0 false status))))))))
 	      
-(defn start-request-dispatcher [dispatcher in-ch & {:keys [buffer-len timeout]
-                                                :or {buffer-len 5
-					             timeout 1000}}]
+(defn start-request-dispatcher [in-ch dispatcher & {:keys [max-queue-size
+                                                           timeout]
+                                                    :or {max-queue-size 5
+					                 timeout 1000}}]
   (let [out-ch (async/chan 1000)
         pending? #(> (count %) 0)
         send-res (fn [xs]
@@ -80,86 +82,138 @@
     (async/thread
       (loop [queue []]
         (let [i (count queue)]
-          (if (< i buffer-len)
+          (if (< i max-queue-size)
             (if-let [req (async/<!! in-ch)]
-              (recur (conj queue (.send dispatcher req)))
+              (recur (conj queue (.invoke dispatcher req)))
               (do
-                (println "Request stream exhausted; polling queue.")
+                (info "Request stream exhausted; polling queue.")
                 (let [[comp pend] (check-queue queue)]
                    (send-res comp)
                    (if (pending? pend)
                      (recur pend)
-                     (do
-                       (println "Closing request-dispatcher channel.")
-                       (async/close! out-ch))))))
+                     (async/close! out-ch)))))
             (do
-              (println "Queue at capacity; polling queue.")
+              (infof "Queue at capacity(%d); waiting..." max-queue-size)
               (let [[comp pend] (check-queue queue)]
                 (send-res comp)
                 (recur pend))))))
-      (println "request-dispatcher thread done."))
+      (info "Request-dispatcher thread done."))
     out-ch))
 
-(defn start-request-loader [func-name events & {:keys [size]
-                                         :or {size 100}}]
-  (let [out-ch (async/chan size)]
+(defn start-request-loader [func-name blocks & {:keys [buffer-size
+                                                       serializer]
+                                                :or {buffer-size 500
+						     serializer #(json/write-str %)}}]
+  (let [out-ch (async/chan buffer-size)]
     (async/thread
-      (doseq [event events]
-        ;; TODO: xform blocks ->  s3 events
-        (async/>!! out-ch (invoke-request func-name (json/write-str event))))
+      (doseq [block blocks]
+        (async/>!! out-ch (invoke-request func-name (serializer block))))
       (async/close! out-ch))
     out-ch))
 
 
-(defn load-events [source]
+(defn load-blocks [source]
   (json/read-str (slurp source)))
 
-(defn launch [source dispatcher func-name & {:keys [handler]
-                                             :or {handler #(.get %)}}] ;; :completion-handler (fn [x] ...)
-  (let [events (load-events source)
-        out-ch (->> (start-request-loader func-name events)
-                    (start-request-dispatcher dispatcher))]
+(defn launch [source dispatcher func-name event-serializer max-queue-size & {:keys [result-handler]
+                                                                             :or {result-handler #(.get %)}}]
+  (let [blocks (load-blocks source)
+        out-ch (-> (start-request-loader func-name blocks :serializer event-serializer)
+                   (start-request-dispatcher dispatcher :max-queue-size max-queue-size))]
     (loop [i 1]
       (if-let [res (async/<!! out-ch)]
         (do
-          (println (format "RESULT[%d]" i))
-          (println (handler res)) ;; TODO: call check status on all returned futures  (configure runtime handlers)
+          (infof ">>>>>>>>>> (%d) <<<<<<<<<<" i)
+          (result-handler res)
           (recur (inc i)))))))
 
+
+
+;;; -------------
+;;; - Protocols
+;;; -------------
+
+;;; Lambda Dispatcher
+
 (defprotocol EventDispatcher
-  (send [_ req] "send lambda request"))
+  (invoke [_ req] "dispatch event"))
 
 (deftype LambdaEventDispatcher [lambda]
   EventDispatcher
-  (send [_ request] (.invokeAsync lambda request)))
+  (invoke [_ request] (.invokeAsync lambda request)))
 
-;; ----- MAIN -----
+(defn result-handler [res]
+  (check-status res))
 
+(defn test-lambda [source func-name max-queue-size evt-ser]
+  (let [dispatch (LambdaEventDispatcher. (lambda-client))]
+    (launch source dispatch func-name evt-ser max-queue-size :result-handler check-status)
+    (System/exit 0)))
+
+
+;;; Test Dispatcher
+
+(comment
 (defprotocol TestEventDispatcher
-  (send [_ req] "send test event"))
+  (invoke [_ req] "send test event"))
+)
 
 (deftype FooDispatcher [executor]
-  TestEventDispatcher
-  (send [_ req]
+  EventDispatcher
+  (invoke [_ req]
      (.submit executor (fn []
        (let [timeout (* (rand-int 10) 1000)]
          (Thread/sleep timeout)
          {:duration timeout})))))
 
-(defn test-dispatch [source func-name threads]
-  (blocks-core/with-pool [pool (Executors/newFixedThreadPool threads)]
-    (let [dispatch (FooDispatcher. pool)]
-      (launch source dispatch func-name))))
-  
+(defn test-dispatch [source func-name max-queue-size threads]
+  (with-pool [pool (Executors/newFixedThreadPool threads)]
+    (let [dispatch (FooDispatcher. pool)
+          evt-ser #(json/write-str %)
+          handler (fn [res]
+                    (let [ret (.get res)]
+                      (infof "RESULT=%s" ret)))]
+      (launch source dispatch func-name evt-ser max-queue-size :result-handler handler))))
+
+
+;;;; ----- MAIN -----
+
+;;; UDFs
+
+(defn encode [s]
+  (clojure.string/replace s #"=" "%3D"))
+
+(defn s3-event [blk]
+  {"Records" [
+    {"s3" {
+      "object" {
+        "key" (encode (blk "id"))
+       }
+       "bucket" {
+         "name" (blk "bkt")
+       }}}]})
+
+(defn block->event [blk]
+  (json/write-str (s3-event blk)))
+
+(defn test-evt-ser [source]
+  (let [blocks (load-blocks source)]
+    (doseq [blk blocks]
+      (info (block->event blk)))))
 
 (defn -main
   [& args]
   (let [source    (nth args 0)
         func-name (nth args 1)
-	lambda    (client)]
-    (println (format "LAMBDA[%s]" func-name))
-    (println (format "SOURCE=%s" source))
+        max-queue (read-string (nth args 2))
+        lambda    (lambda-client)
+        threads   3]
+    (infof "LAMBDA[%s]" func-name)
+    (infof "SOURCE=%s" source)
+    (infof "MAX_QUEUE_SIZE=%d" max-queue)
     (try
-      (test-dispatch source func-name 3)
+      ;(test-dispatch source func-name max-queue threads)
+      (test-lambda source func-name max-queue block->event)
+      ;(test-evt-ser source)
       (finally
         (shutdown-agents)))))
