@@ -16,4 +16,5 @@
                  [com.taoensso/timbre "4.10.0"]]
   :main ^:skip-aot blocks.core
   :target-path "target/%s"
+  :global-vars {*warn-on-reflection* true}
   :profiles {:uberjar {:aot :all}})
