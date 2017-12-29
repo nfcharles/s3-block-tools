@@ -161,34 +161,6 @@
       (info "Request-dispatcher thread done."))
     out-ch))
 
-(comment
-(defn start-request-loader [func-name blocks & {:keys [buffer-size
-                                                       serializer]
-                                                :or {buffer-size 500
-						     serializer #(json/write-str %)}}]
-  (let [out-ch (async/chan buffer-size)]
-    (async/thread
-      (doseq [block blocks]
-        (async/>!! out-ch (invoke-request func-name (serializer block))))
-      (async/close! out-ch))
-    out-ch))
-)
-
-(comment
-(defn launch [source dispatcher func-name event-serializer max-queue-size & {:keys [result-handler]
-                                                                             :or {result-handler #(.get %)}}]
-  (let [blocks (load-blocks source)
-        out-ch (-> (start-request-loader func-name blocks :serializer event-serializer)
-                   (start-request-dispatcher dispatcher :max-queue-size max-queue-size))]
-    (loop [i 1]
-      (if-let [fut-pkt (async/<!! out-ch)]
-        (do
-          (infof "=== %d ===" i)
-          (result-handler fut-pkt)
-          (info "___")
-          (recur (inc i)))))))
-)
-
 (defn run [source dispatcher max-queue-size & {:keys [result-handler]
                                                :or {result-handler #(.get %)}}]
   (let [out-ch (start-request-dispatcher source dispatcher :max-queue-size max-queue-size)]
@@ -209,9 +181,6 @@
             (spit filename failures))
           (info "Processing complete without errors"))))))
 
-(defn load-json [path]
-  (json/read-str (slurp path)))
-
 (defn -launch [dispatcher func-name evts max-queue-size result-handler]
   (infof "Loaded %d events" (count evts))
   (run (async/to-chan (map #(invoke-request func-name %) evts))
@@ -221,40 +190,29 @@
 
 (defn launch-from-events [client path func-name max-queue-size]
   (debug "Lauching from events source")
-  (let [evts (load-json path)]
+  (let [evts (blks-util/load-json path)]
     (-launch (LambdaEventDispatcher. client) func-name evts max-queue-size check-status)))
 
 
 (defn launch-from-blocks [client path func-name max-queue-size]
   (debug "Lauching from blocks source")
-  (let [evts (map blks-evt/event (load-json path))]
+  (let [evts (map blks-evt/event (blks-util/load-json path))]
     (-launch (LambdaEventDispatcher. client) func-name evts max-queue-size check-status)))
 
 ;;;; ----- MAIN -----
 
 ;;; UDFs
-(comment
-(defn test-lambda [lambda source func-name max-queue-size evt-ser]
-  (let [dispatch (LambdaEventDispatcher. lambda)]
-    (run source dispatch func-name evt-ser max-queue-size :result-handler check-status)
-    (System/exit 0)))
-)
 
 (comment
-(defn test-dispatch [source func-name max-queue-size threads]
+(defn test-dispatch [path func-name max-queue-size threads]
   (with-pool [pool (Executors/newFixedThreadPool threads)]
     (let [dispatch (FooDispatcher. pool)
-          evt-ser #(json/write-str %)
+          source (async/to-chan (blks-util/load-json path))
           handler (fn [^Future res]
                     (let [ret (.get res)]
                       (infof "RESULT=%s" ret)))]
-      (run source dispatch func-name evt-ser max-queue-size :result-handler handler))))
+      (run source dispatch max-queue-size :result-handler handler))))
 )
-
-(defn test-evt-ser [path]
-  (let [blocks (load-json path)]
-    (doseq [blk blocks]
-      (info (blks-evt/event blk)))))
 
 (defn -main
   [& args]
@@ -268,9 +226,8 @@
     (infof "MAX_QUEUE_SIZE=%d" max-queue)
     (try
       (launch-from-blocks lambda path func-name max-queue)
+      ;(launch-from-events lambda path func-name max-queue)
       ;(test-dispatch path func-name max-queue threads)
-      ;(test-lambda lambda path func-name max-queue (blks-evt/block->event))
-      ;(test-evt-ser path)
       (finally
         (shutdown-agents)
 	(System/exit 0)))))

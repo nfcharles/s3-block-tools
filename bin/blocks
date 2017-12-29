@@ -1,0 +1,89 @@
+#! /bin/bash
+
+USAGE="
+Usage: blocks [options] BUCKET PREFIXES FILES EXPRESSION
+
+Description:
+  Writes block ids from BUCKET corresponding to PREFIXES into FILES.  EXPRESSION is used to indicate block
+  metadata files.
+
+  e.g.
+
+  Sample Hive table layout w/ block metadata
+
+  2017-08-30 13:00:23          1 /test/foo/z=27
+  2017-08-30 13:00:34         21 /test/foo/z=27/000000_0   *  -------
+  2017-08-30 13:00:46          1 /test/foo/z=3                      |
+  2017-08-30 13:01:01         21 /test/foo/z=3/000000_0    *        |
+  2017-08-30 13:01:09          1 /test/bar/z=6                      |
+  2017-08-30 13:01:16         21 /test/bar/z=6/000000_0    *        | -> deserialized inodes contain block id refs
+  2017-08-30 13:00:12          1 /test/bar/z=64                     |
+  2017-08-30 13:00:15         21 /test/bar/z=64/000000_0   *        |
+  2017-08-30 12:59:18        232 block_-1381873372567827756         |
+  2017-08-30 12:59:05        232 block_-9167327871567959482  <-------
+  2017-08-30 12:58:56        232 block_1094235986601944229
+  2017-08-30 12:59:11        232 block_7692193377734623887
+
+  * block metadata file
+
+  blocks --threads 4
+    my-bucket
+    \"/test/foo/z=27,/test/foo/z=3,...\"   # prefixes
+    \"foo-27,foo-3,...\"                   # filenames
+    \"foo/z=.*/[0-9]*_[0-9]*$\"            # block identifier expression
+
+  Returns all blocks at prefixes /test/foo/z=27 and /test/foo/z=3 and writes to files
+  foo-27.json and foo-3.json respectively.
+
+
+Options:
+  -t, --threads  Number of processing threads
+  -h, --help     Show help
+
+Dependencies:
+  lein     https://leiningen.org/
+"
+
+function _help() {
+    echo -e "$USAGE"
+    exit 1
+}
+
+if [[ $1 == "--help" || $1 == "-h" ]]; then
+    _help
+fi
+
+while [[ $# > 4 ]]; do
+    key="$1"
+    case $key in
+	-t|--threads)
+	    THREADS="$2"
+	    shift
+	    ;;
+	*)
+	    # unknown option
+	    _help
+	    ;;
+    esac
+    shift
+done
+
+# Required parameters
+BUCKET="$1"
+PREFIXES="$2"
+FILES="$3"
+EXPRESSION="$4"
+
+echo "--- BLOCKS ENV CONFIGURATION ---"
+echo "BUCKET=$BUCKET"
+echo "THREADS=$THREADS"
+echo "PREFIXES=$PREFIXES"
+echo "FILES=$FILES"
+echo "EXPRESSION=$EXPRESSION"
+
+lein run -m blocks.core \
+     $THREADS \
+     $BUCKET \
+     $PREFIXES \
+     $FILES \
+     $EXPRESSION
