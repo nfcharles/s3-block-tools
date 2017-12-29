@@ -68,6 +68,10 @@ while [[ $# > 4 ]]; do
     shift
 done
 
+if [[ $# < 4 ]]; then
+    _help
+fi
+
 # Required parameters
 BUCKET="$1"
 PREFIXES="$2"
