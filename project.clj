@@ -6,6 +6,7 @@
   :dependencies [[org.clojure/clojure "1.8.0"]
                  [org.clojure/core.async "0.2.374"]
                  [org.clojure/data.json "0.2.6"]
+                 [org.clojure/tools.cli "0.3.5"]
                  [com.fasterxml.jackson.core/jackson-core "2.9.3"]
                  [com.fasterxml.jackson.core/jackson-annotations "2.9.3"]
                  [com.amazonaws/aws-java-sdk-core "1.11.242"]
@@ -16,5 +17,5 @@
                  [com.taoensso/timbre "4.10.0"]]
   :main ^:skip-aot blocks.core
   :target-path "target/%s"
-  :global-vars {*warn-on-reflection* true}
+  :global-vars {*warn-on-reflection* false}
   :profiles {:uberjar {:aot :all}})

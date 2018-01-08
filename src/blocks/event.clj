@@ -1,5 +1,6 @@
 (ns blocks.event
   (:require [blocks.util :as blks-util]
+            [blocks.error :refer :all]
             [clojure.data.json :as json]
             [taoensso.timbre :as timbre :refer [log debug info  debugf infof]])
   (:gen-class))
@@ -9,14 +10,17 @@
   (clojure.string/replace s #"=" "%3D"))
 
 (defn event [blk]
-  {"Records" [
-    {"s3" {
-       "object" {
-         "key" (encode (blk "id"))
-       }
-       "bucket" {
-         "name" (blk "bkt")
-       }}}]})
+  (if (and (blk "id") (blk "bkt"))
+    {"Records" [
+      {"s3" {
+         "object" {
+           "key" (encode (blk "id"))
+         }
+         "bucket" {
+           "name" (blk "bkt")
+         }}}]}
+    (throw (blocks.error.InvalidBlockIndexFormatException.
+             (format "\"id\" and \"bkt\" fields required.\n%s" (json/write-str blk))))))
 
 
 (defn -main

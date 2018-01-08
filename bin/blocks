@@ -85,9 +85,11 @@ echo "PREFIXES=$PREFIXES"
 echo "FILES=$FILES"
 echo "EXPRESSION=$EXPRESSION"
 
-lein run -m blocks.core \
-     $THREADS \
-     $BUCKET \
-     $PREFIXES \
-     $FILES \
-     $EXPRESSION
+#lein run -m blocks.core \
+#     $THREADS \
+#     $BUCKET \
+#     $PREFIXES \
+#     $FILES \
+#     $EXPRESSION
+
+lein run -m blocks.core copy --threads $THREADS $BUCKET $PREFIXES $FILES $EXPRESSION

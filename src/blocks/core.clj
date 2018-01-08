@@ -1,197 +1,172 @@
 (ns blocks.core
-  (:require [clojure.core.async :as async]
-            [clojure.data.json :as json]
+  (:require [clojure.tools.cli :refer [parse-opts]]
             [clojure.pprint :as pprint]
-            [blocks.macro :refer :all]
-            [taoensso.timbre :as timbre :refer [log debug info warn error fatal debugf infof warnf]])
-  (import [org.apache.hadoop.fs.s3 Jets3tFileSystemStore INode]
-	  [org.apache.hadoop.fs Path]	  
-	  [org.jets3t.service S3Service]
-          [org.jets3t.service.impl.rest.httpclient RestS3Service]
-	  [org.jets3t.service.model S3Bucket S3Object]
-	  [org.jets3t.service.security AWSCredentials]
-	  [com.amazonaws.auth DefaultAWSCredentialsProviderChain]
-	  [java.net URI URLEncoder]
-	  [java.util.concurrent Executors ExecutorCompletionService])
+            [blocks.block :as block]
+            [blocks.lambda :as lambda])
   (:gen-class))
 
+;; blocks -h copy -h --threads 10 BUCKET PREFIXES FILES EXPRESSION
+;; blocks -h lambda -h --queue-size 10 --block --event PATH LAMBDA
 
-(defn credentials []
-  (let [creds (.getCredentials (DefaultAWSCredentialsProviderChain.))]
-    (hash-map
-      :access-key (.getAWSAccessKeyId creds)
-      :secret-key (.getAWSSecretKey creds))))
-
-(defn service [access-key secret-key]
-  (let [aws-creds (AWSCredentials. access-key secret-key)]
-    (RestS3Service. aws-creds)))
-
-(defn rest-client []
-  (let [creds (credentials)]
-    (service (:access-key creds) (:secret-key creds))))
-
-(def file-system-name "fs")
-(def file-system-value "Hadoop")
-(def file-system-type-name "fs-type")
-(def file-system-type-value "block")
-(def file-system-version-name "fs-version")
-(def file-system-version-value "1")
-
-(def metadata
-  (hash-map
-    "fs" "Hadoop"
-    "fs-type" "block"
-    "fs-version" "1"))
-
-(defn -field [s3Obj field]
-  (.getMetadata s3Obj field))
-
-(defn check-metadata [s3obj]
-  (let [name (-field file-system-name)
-        type (-field file-system-type-name)
-	dver (-field file-system-version-name)]
-    (if (not= file-system-value name)
-      (throw (java.lang.Exception. "Not a Hadoop S3 file.")))
-    (if (not= file-system-type-value type)
-      (throw (java.lang.Exception. "Not a block file")))
-    (if (not= file-system-version-value dver)
-      (throw (java.lang.Exception.
-               (format "Version mismatch: %d != %d" file-system-version-value dver))))))
-  
-(defn bucket [name]
-  (S3Bucket. name))
-
-(defn -get [svc bkt key meta?]
-  (let [obj (.getObject svc bkt key)]
-    (if meta?
-      (check-metadata obj))
-    (.getDataInputStream obj)))
-    
-(defn inode [svc bkt path]
-  (INode/deserialize (-get svc bkt path false)))
-
-(defn gen-filter [expr]
-  (fn [key]
-    (let [res (re-matches (re-pattern expr) key)]
-      res)))
-
-(defn block-name [id]
-  (str "block_" id))
-
-(defn record [bkt blk]
-  (hash-map
-    :bkt bkt
-    :id  (block-name (.getId blk))
-    :len (.getLength blk)))
-
-(defn get-blocks [svc bkt path]
-  (let [bkt-name (.getName bkt)]
-    (loop [blks (.getBlocks (inode svc bkt path))
-           acc []]
-      (if-let [blk (first blks)]
-        (recur (rest blks) (conj acc (record bkt-name blk)))
-        acc))))
-
-(defn list-objects [svc bkt-name pfx & {:keys [delim filter]
-                                         :or {delim nil
-					      filter (fn [x] true)}}]
-  (let [ret (.listObjects svc bkt-name pfx delim)]
-    (infof "count.keys.unfiltered %d" (count ret))
-    (loop [objs ret
-           acc []]
-      (if-let [o (first objs)]
-        (let [key (.getKey o)]
-          (if (filter key)
-	    (recur (rest objs) (conj acc key))
-	    (recur (rest objs) acc)))
-        acc))))
-
-(defn -get-from-svc [csvc]
-  (try
-    (.get (.take csvc))
-    (catch java.lang.Exception e
-      (error e))))
-
-(defn assemble-blocks [csvc n & {:keys [progress-interval]
-                                 :or {progress-interval 50}}]
-  (loop [i n
-         acc []]
-    (if (> i 0)
-      (if-let [res (-get-from-svc csvc)]
-        (let [remain (dec i)]
-          (if (= 0 (mod remain progress-interval))
-	    (infof "%d blocks remaining" remain))
-          (recur remain (conj acc res))))
-      (do
-        (infof "Retrieved %d blocks" n)
-        (flatten acc)))))
-
-;; (sort-by #(:len %) < blocks)
-
-;;; ----- DRIVERS -----
-
-(defn start-block-reader [threads svc bkt in-ch]
-  (let [out-ch (async/chan 10)]
-    (async/thread
-      (infof "Starting block reader...")
-      (with-pool [pool (Executors/newFixedThreadPool threads)]
-        (time
-          (let [csvc (ExecutorCompletionService. pool)]
-            (loop []	  
-              (if-let [payload (async/<!! in-ch)]
-                (let [keys (:keys payload)]
-                  (infof "Getting blocks for prefix=%s..." (:pfx payload))
-                  (doseq [key keys]
-                    (.submit csvc #(get-blocks svc bkt key)))
-                  (async/>!! out-ch (assemble-blocks csvc (count keys)))
-		  (recur))
-                (async/close! out-ch))))))
-      (info "Block Reader done."))
-  out-ch))
-    
-(defn start-prefix-reader [svc bkt expr pfxs]
-  (let [out-ch (async/chan 10)]
-    (async/thread
-      (info "Starting key reader...")
-      (doseq [pfx pfxs]
-        (let [keys (list-objects svc bkt pfx :filter (gen-filter expr))]
-          (infof "count.keys.filtered %d" (count keys))
-	  (async/>!! out-ch {:pfx pfx :keys keys})))
-      (async/close! out-ch)
-      (info "Key Reader done."))
-    out-ch))
+(defn parse-list [s]
+  (clojure.string/split s #","))
 
 
-;;;;  MAIN
+;;; ----------------
+;;; -   OPTIONS    -
+;;; ----------------
 
-(defn write-blocks [name blks]
-  (let [f (format "%s.json" name)]
-    (infof "Writing blocks file \"%s\"" f)
-    (spit f (json/write-str blks))
-    (info "done")))
+(def global-options
+  [["-h" "--help"]])
 
-(defn write [names in-ch]
-  (loop [pfxs names]
-    (if-let [blks (async/<!! in-ch)]
-      (do
-        (write-blocks (first pfxs) blks)
-	(recur (rest pfxs))))))
+(def copy-options
+  [["-t" "--threads THREAD" "Thread count"
+    :default 4
+    :parse-fn read-string]
+   ["-h" "--help"]])
+
+(def lambda-options
+  [["-q" "--queue-size SIZE" "Max event queue size"
+    :default 10
+    :parse-fn read-string]
+   ["-i" "--input-type INPUT_TYPE (\"block\"|\"event\")" "Input file type"
+    :default "block"]
+   ["-h" "--help"]])
+
+
+;;; ----------------
+;;; -    USAGE     -
+;;; ----------------
+
+(defn global-usage [summary]
+  (->> ["Utility for retrieving blocks or submitting events for lambda execution."
+        ""
+        "Usage: blocks [options] copy|lambda"
+        ""
+        "Options:"
+        summary]
+        (clojure.string/join "\n")))
+
+(defn copy-usage [summary]
+  (->> ["Copies blocks from BUCKET subject to PREFIXES to FILES.  Blocks are"
+        "identified by EXPRESSION (regular expression)."
+        ""
+        "Usage: blocks [options] copy BUCKET PREFIXES FILES EXPRESSION"
+        ""
+        "Options:"
+        summary]
+        (clojure.string/join "\n")))
+
+(defn lambda-usage [summary]
+  (->> ["Submits events for lambda execution.  At most SIZE events are submitted concurrently."
+        ""
+        "Usage: blocks [options] lambda PATH FUNCTION"
+        ""
+        "Options:"
+        summary]
+        (clojure.string/join "\n")))
+
+
+;;; -----------------
+;;; -    COPY       -
+;;; -----------------
+
+(def copy-pos-len 4)
+
+(defn invoke-copy [bkt thrds expr pfxs paths]
+  (let [clnt (block/client)]
+    (block/launch clnt bkt thrds expr pfxs paths)))
+
+(defn assemble-copy-callable [args opts summary]
+  ;(println (format "OPTS=%s" opts))
+  (if (= copy-pos-len (count args))
+    (let [[bkt pfxs paths expr] args]
+      {:fn #(invoke-copy bkt (:threads opts) expr (parse-list pfxs) (parse-list paths))})
+    {:error "Not enough positional arguments." :usage (copy-usage summary)}))
+
+(defn parse-copy [args]
+  ;(println (format "COPY_ARGS=%s" args))
+  (let [{:keys [options arguments errors summary]}
+        (parse-opts args copy-options)]
+    (cond
+      errors          {:error (clojure.string/join "\n" errors)
+                       :usage (copy-usage summary)}
+      (:help options) {:error nil
+                       :usage (copy-usage summary)}
+      :else           (assemble-copy-callable arguments options summary))))
+
+
+;;; -----------------
+;;; -    LAMBDA     -
+;;; -----------------
+
+(def lambda-pos-len 2)
+
+(defn invoke-lambda [src path func-name q-size]
+  (let [clnt (lambda/client)]
+    (lambda/launch clnt src path func-name q-size)))
+
+(defn parse-source [src]
+  (if (contains? #{"block" "event"} src)
+    src))
+
+(defn assemble-lambda-callable [args opts summary]
+  ;(println (format "OPTS=%s" opts))
+  (if (= lambda-pos-len (count args))
+    (if-let [src (parse-source (:input-type opts))]
+      (let [[path func-name] args]
+        {:fn #(invoke-lambda src path func-name (:queue-size opts))})
+      {:error (format "Invalid --input-type: \"%s\"" (:input-type opts)) :usage (lambda-usage summary)})
+    {:error "Not enough positional arguments." :usage (lambda-usage summary)}))
+
+(defn parse-lambda [args]
+  ;(println (format "LAMBDA_ARGS=%s" args))
+  (let [{:keys [options arguments errors summary]}
+        (parse-opts args lambda-options)]
+    (cond
+      errors          {:error (clojure.string/join "\n" errors)
+                       :usage (lambda-usage summary)}
+      (:help options) {:usage (lambda-usage summary)}
+      :else           (assemble-lambda-callable arguments options summary))))
+
+
+;;; -----------------
+;;; -    GENERAL    -
+;;; -----------------
+
+(defn parse [args opts]
+  (let [{:keys [options arguments errors summary]}
+        (parse-opts args opts :in-order true)]
+    ;(println (format "OPTS=%s\nARGS=%s\nERR=%s\nSUM=%s\n" options arguments errors summary))
+    (if (:help options)
+      {:usage (global-usage summary)}
+      (if-let [cmd (first arguments)]
+        (case cmd
+          "copy"   (parse-copy (rest arguments))
+          "lambda" (parse-lambda (rest arguments))
+          {:error (format "Unknown command: %s" cmd)
+           :usage (global-usage summary)})
+        {:usage (global-usage summary)}))))
+
+
+(defn handle-error [in]
+  (println (format "%s\n-----\n" (:error in)))
+  (println (:usage in))
+  (System/exit 1))
+
+(defn handle-usage [in]
+  (println (:usage in))
+  (System/exit 0))
+
 
 (defn -main
   [& args]
-  (let [thrd  (read-string (nth args 0))
-        src   (nth args 1)
-	pfxs  (clojure.string/split (nth args 2) #",")
-        names (clojure.string/split (nth args 3) #",")	
-	expr  (nth args 4)
-	svc   (rest-client)
-	bkt   (bucket src)]
-    (infof "THREADS=%d" thrd)
-    (infof "BUCKET=%s" src)
-    (infof "PREFIX=%s" pfxs)
-    (infof "NAMES=%s" names)
-    (infof "EXPR=%s" expr)
-
-    (let [out (->> (start-prefix-reader svc bkt expr pfxs)
-                   (start-block-reader thrd svc bkt))]
-      (write names out))))
+  (let [ret (parse args global-options)]
+    (try
+      (cond
+        (:error ret) (handle-error ret)
+        (:usage ret) (handle-usage ret)
+        :else        ((:fn ret)))
+      (catch Exception e
+        (println e)
+        (System/exit 1)))))
