@@ -1,4 +1,4 @@
-(defproject blocks "0.1.0-SNAPSHOT"
+(defproject blocks "0.2.0-SNAPSHOT"
   :description "S3 block and lambda tools"
   :url "https://github.com/nfcharles/s3-block-tools"
   :license {:name "Eclipse Public License"

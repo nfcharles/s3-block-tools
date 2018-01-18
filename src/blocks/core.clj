@@ -5,12 +5,9 @@
             [blocks.lambda :as lambda])
   (:gen-class))
 
-;; blocks -h copy -h --threads 10 BUCKET PREFIXES FILES EXPRESSION
-;; blocks -h lambda -h --queue-size 10 --block --event PATH LAMBDA
 
 (defn parse-list [s]
   (clojure.string/split s #","))
-
 
 ;;; ----------------
 ;;; -   OPTIONS    -
@@ -19,14 +16,14 @@
 (def global-options
   [["-h" "--help"]])
 
-(def copy-options
+(def find-options
   [["-t" "--threads THREAD" "Thread count"
     :default 4
     :parse-fn read-string]
    ["-h" "--help"]])
 
 (def lambda-options
-  [["-q" "--queue-size SIZE" "Max event queue size"
+  [["-c" "--concurrency CONCURRENCY" "Max concurrent lambda invocations"
     :default 10
     :parse-fn read-string]
    ["-i" "--input-type INPUT_TYPE (\"block\"|\"event\")" "Input file type"
@@ -39,26 +36,26 @@
 ;;; ----------------
 
 (defn global-usage [summary]
-  (->> ["Utility for retrieving blocks or submitting events for lambda execution."
+  (->> ["Utility for identifying block files and invoking lambda functions with s3 events."
         ""
-        "Usage: blocks [options] copy|lambda"
+        "Usage: blocks [options] find|lambda"
         ""
         "Options:"
         summary]
         (clojure.string/join "\n")))
 
-(defn copy-usage [summary]
-  (->> ["Copies blocks from BUCKET subject to PREFIXES to FILES.  Blocks are"
-        "identified by EXPRESSION (regular expression)."
+(defn find-usage [summary]
+  (->> ["Identifies block files from BUCKET filtered by PREFIXES.  Block files from each PREFIX"
+        "are copied to FILES respectively.  Block files are identified by EXPRESSION (regexp)."
         ""
-        "Usage: blocks [options] copy BUCKET PREFIXES FILES EXPRESSION"
+        "Usage: blocks [options] find BUCKET PREFIXES FILES EXPRESSION"
         ""
         "Options:"
         summary]
         (clojure.string/join "\n")))
 
 (defn lambda-usage [summary]
-  (->> ["Submits events for lambda execution.  At most SIZE events are submitted concurrently."
+  (->> ["Submits events for lambda execution.  At most CONCURRENCY events are executed concurrently."
         ""
         "Usage: blocks [options] lambda PATH FUNCTION"
         ""
@@ -68,32 +65,32 @@
 
 
 ;;; -----------------
-;;; -    COPY       -
+;;; -    FIND       -
 ;;; -----------------
 
-(def copy-pos-len 4)
+(def find-pos-len 4)
 
-(defn invoke-copy [bkt thrds expr pfxs paths]
+(defn invoke-find [bkt thrds expr pfxs paths]
   (let [clnt (block/client)]
     (block/launch clnt bkt thrds expr pfxs paths)))
 
-(defn assemble-copy-callable [args opts summary]
+(defn assemble-find-callable [args opts summary]
   ;(println (format "OPTS=%s" opts))
-  (if (= copy-pos-len (count args))
+  (if (= find-pos-len (count args))
     (let [[bkt pfxs paths expr] args]
-      {:fn #(invoke-copy bkt (:threads opts) expr (parse-list pfxs) (parse-list paths))})
-    {:error "Not enough positional arguments." :usage (copy-usage summary)}))
+      {:fn #(invoke-find bkt (:threads opts) expr (parse-list pfxs) (parse-list paths))})
+    {:error "Not enough positional arguments." :usage (find-usage summary)}))
 
-(defn parse-copy [args]
-  ;(println (format "COPY_ARGS=%s" args))
+(defn parse-find [args]
+  ;(println (format "FIND_ARGS=%s" args))
   (let [{:keys [options arguments errors summary]}
-        (parse-opts args copy-options)]
+        (parse-opts args find-options)]
     (cond
       errors          {:error (clojure.string/join "\n" errors)
-                       :usage (copy-usage summary)}
+                       :usage (find-usage summary)}
       (:help options) {:error nil
-                       :usage (copy-usage summary)}
-      :else           (assemble-copy-callable arguments options summary))))
+                       :usage (find-usage summary)}
+      :else           (assemble-find-callable arguments options summary))))
 
 
 ;;; -----------------
@@ -115,7 +112,7 @@
   (if (= lambda-pos-len (count args))
     (if-let [src (parse-source (:input-type opts))]
       (let [[path func-name] args]
-        {:fn #(invoke-lambda src path func-name (:queue-size opts))})
+        {:fn #(invoke-lambda src path func-name (:concurrency opts))})
       {:error (format "Invalid --input-type: \"%s\"" (:input-type opts)) :usage (lambda-usage summary)})
     {:error "Not enough positional arguments." :usage (lambda-usage summary)}))
 
@@ -142,7 +139,7 @@
       {:usage (global-usage summary)}
       (if-let [cmd (first arguments)]
         (case cmd
-          "copy"   (parse-copy (rest arguments))
+          "find"   (parse-find (rest arguments))
           "lambda" (parse-lambda (rest arguments))
           {:error (format "Unknown command: %s" cmd)
            :usage (global-usage summary)})
